@@ -1,0 +1,1103 @@
+#!/bin/sh
+# =========================================================
+#  SHAMIM WiFi - Hotspot Voucher Admin Panel (v1.0)
+#  Single-file CGI for OpenWrt (uhttpd) + openNDS theme_voucher
+#  Install:  /www/cgi-bin/shamim   (chmod 755)
+#  Open:     http://192.168.1.1/cgi-bin/shamim
+#  Default login: admin / shamim123  (change in Settings!)
+# =========================================================
+
+CFGDIR="${SHAMIM_CFGDIR:-/etc/shamim}"
+CFG="$CFGDIR/config"
+VFILE="${SHAMIM_VFILE:-/etc/opennds/vouchers.txt}"
+SESSFILE="${SHAMIM_SESS:-/tmp/shamim_sessions}"
+
+mkdir -p "$CFGDIR" 2>/dev/null
+if [ ! -f "$CFG" ]; then
+	{
+	printf 'ADMIN_ID=admin\n'
+	printf 'ADMIN_PW=shamim123\n'
+	printf 'LANIF=br-lan\n'
+	printf 'BRAND="SHAMIM WiFi"\n'
+	} > "$CFG"
+fi
+. "$CFG"
+[ -n "$LANIF" ] || LANIF="br-lan"
+[ -n "$BRAND" ] || BRAND="SHAMIM WiFi"
+[ -n "$RB_TYPE" ] || RB_TYPE="disabled"
+[ -n "$RB_HH" ] || RB_HH=4
+[ -n "$RB_MM" ] || RB_MM=0
+VERSION="1.1"
+PKFILE="$CFGDIR/packages.txt"
+PRFILE="$CFGDIR/prices.txt"
+CRONF="${SHAMIM_CRON:-/etc/crontabs/root}"
+touch "$PKFILE" "$PRFILE" 2>/dev/null
+if [ ! -f "$VFILE" ]; then
+	mkdir -p "$(dirname "$VFILE")" 2>/dev/null
+	: > "$VFILE"
+fi
+touch "$SESSFILE" 2>/dev/null
+
+# ---------- helpers ----------
+urldecode() {
+	printf '%b' "$(printf '%s' "$1" | sed -e 's/+/ /g' -e 's/%\([0-9A-Fa-f][0-9A-Fa-f]\)/\\x\1/g')"
+}
+
+BODY=""
+if [ "$REQUEST_METHOD" = "POST" ] && [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ] 2>/dev/null; then
+	BODY=$(head -c "$CONTENT_LENGTH")
+fi
+
+param() {
+	_v=$(printf '%s&%s' "$QUERY_STRING" "$BODY" | tr '&' '\n' | grep "^$1=" | head -n1 | cut -d= -f2-)
+	urldecode "$_v"
+}
+
+jesc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+write_cfg() {
+	{
+	printf 'ADMIN_ID=%s\n' "$ADMIN_ID"
+	printf 'ADMIN_PW=%s\n' "$ADMIN_PW"
+	printf 'LANIF=%s\n' "$LANIF"
+	printf 'BRAND="%s"\n' "$BRAND"
+	printf 'TG_TOKEN="%s"\n' "$TG_TOKEN"
+	printf 'TG_CHAT="%s"\n' "$TG_CHAT"
+	printf 'PAY_BKASH="%s"\n' "$PAY_BKASH"
+	printf 'PAY_NAGAD="%s"\n' "$PAY_NAGAD"
+	printf 'PAY_NOTE="%s"\n' "$PAY_NOTE"
+	printf 'PORTAL_MSG="%s"\n' "$PORTAL_MSG"
+	printf 'RB_TYPE=%s\n' "$RB_TYPE"
+	printf 'RB_HH=%s\n' "$RB_HH"
+	printf 'RB_MM=%s\n' "$RB_MM"
+	} > "$CFG"
+}
+jhdr() { printf 'Content-type: application/json\r\n\r\n'; }
+err() { jhdr; printf '{"ok":0,"err":"%s"}' "$(jesc "$1")"; exit 0; }
+okj() { jhdr; printf '{"ok":1}'; exit 0; }
+
+is_mac()  { printf '%s' "$1" | grep -qE '^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$'; }
+is_num()  { printf '%s' "$1" | grep -qE '^[0-9]+$'; }
+is_code() { printf '%s' "$1" | grep -qE '^[A-Za-z0-9-]{9}$'; }
+gencode() { tr -dc 'A-HJ-NP-Z2-9' < /dev/urandom | head -c 9; }
+mktoken() { tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32; }
+
+COOKIE_TOKEN=$(printf '%s' "$HTTP_COOKIE" | tr ';' '\n' | sed 's/^ *//' | grep '^SHSESS=' | head -n1 | cut -d= -f2)
+is_auth() { [ -n "$COOKIE_TOKEN" ] && grep -q "^$COOKIE_TOKEN$" "$SESSFILE" 2>/dev/null; }
+
+ACTION=$(param action)
+
+if [ -n "$ACTION" ] && [ "$ACTION" != "login" ] && ! is_auth; then
+	jhdr; printf '{"ok":0,"auth":1,"err":"Not logged in"}'; exit 0
+fi
+
+case "$ACTION" in
+
+login)
+	ID=$(param id); PW=$(param pw)
+	if [ -n "$ID" ] && [ "$ID" = "$ADMIN_ID" ] && [ "$PW" = "$ADMIN_PW" ]; then
+		TOK=$(mktoken)
+		printf '%s\n' "$TOK" >> "$SESSFILE"
+		printf 'Content-type: application/json\r\nSet-Cookie: SHSESS=%s; Path=/; HttpOnly\r\n\r\n{"ok":1}' "$TOK"
+	else
+		sleep 1
+		jhdr; printf '{"ok":0,"err":"Wrong Router ID or Password"}'
+	fi
+	exit 0;;
+
+logout)
+	[ -n "$COOKIE_TOKEN" ] && sed -i "/^$COOKIE_TOKEN\$/d" "$SESSFILE" 2>/dev/null
+	okj;;
+
+stats)
+	NOW=$(date +%s)
+	COUNTS=$(awk -F',' -v now="$NOW" 'NF>=7{t++; if($7==0){u++} else if(now < ($7+$6*60)){a++} else {x++}} END{printf "%d %d %d %d", t+0,u+0,a+0,x+0}' "$VFILE")
+	T=$(printf '%s' "$COUNTS" | cut -d' ' -f1)
+	U=$(printf '%s' "$COUNTS" | cut -d' ' -f2)
+	A=$(printf '%s' "$COUNTS" | cut -d' ' -f3)
+	X=$(printf '%s' "$COUNTS" | cut -d' ' -f4)
+	UPT=$(cut -d. -f1 /proc/uptime 2>/dev/null)
+	jhdr
+	printf '{"ok":1,"total":%s,"unused":%s,"active":%s,"expired":%s,"now":%s,"uptime":%s,"brand":"%s","lanif":"%s"}' \
+		"${T:-0}" "${U:-0}" "${A:-0}" "${X:-0}" "$NOW" "${UPT:-0}" "$(jesc "$BRAND")" "$(jesc "$LANIF")"
+	exit 0;;
+
+vlist)
+	NOW=$(date +%s)
+	jhdr
+	printf '{"ok":1,"now":%s,"v":[' "$NOW"
+	awk -F',' 'NF>=7 && $1!="" {printf "%s[\"%s\",%d,%d,%d,%d,%d,%d]", (c++?",":""), $1,$2,$3,$4,$5,$6,$7}' "$VFILE"
+	printf ']}'
+	exit 0;;
+
+vcreate)
+	CODE=$(param code | tr 'a-z' 'A-Z' | tr -d ' ')
+	DOWN=$(param down); UP=$(param up); MINS=$(param mins)
+	[ -z "$CODE" ] && CODE=$(gencode)
+	is_code "$CODE" || err "Code must be exactly 9 letters/numbers (or leave empty for auto)"
+	is_num "$DOWN" || DOWN=0
+	is_num "$UP" || UP=0
+	is_num "$MINS" || err "Validity minutes required"
+	[ "$MINS" -gt 0 ] || err "Validity must be more than 0 minutes"
+	grep -q "^$CODE," "$VFILE" && err "This code already exists"
+	printf '%s,%s,%s,0,0,%s,0\n' "$CODE" "$DOWN" "$UP" "$MINS" >> "$VFILE"
+	PRICE=$(param price)
+	if is_num "$PRICE" && [ "$PRICE" -gt 0 ]; then printf '%s,%s\n' "$CODE" "$PRICE" >> "$PRFILE"; fi
+	jhdr; printf '{"ok":1,"codes":["%s"]}' "$CODE"
+	exit 0;;
+
+vbulk)
+	QTY=$(param qty); DOWN=$(param down); UP=$(param up); MINS=$(param mins)
+	is_num "$QTY" || err "Quantity required"
+	[ "$QTY" -ge 1 ] || err "Quantity must be at least 1"
+	[ "$QTY" -le 1000 ] || err "Maximum 1000 at a time"
+	is_num "$DOWN" || DOWN=0
+	is_num "$UP" || UP=0
+	is_num "$MINS" || err "Validity minutes required"
+	[ "$MINS" -gt 0 ] || err "Validity must be more than 0 minutes"
+	PRICE=$(param price)
+	is_num "$PRICE" || PRICE=0
+	LIST=""
+	i=0
+	while [ "$i" -lt "$QTY" ]; do
+		C=$(gencode)
+		grep -q "^$C," "$VFILE" && continue
+		printf '%s,%s,%s,0,0,%s,0\n' "$C" "$DOWN" "$UP" "$MINS" >> "$VFILE"
+		[ "$PRICE" -gt 0 ] && printf '%s,%s\n' "$C" "$PRICE" >> "$PRFILE"
+		[ -n "$LIST" ] && LIST="$LIST,"
+		LIST="$LIST\"$C\""
+		i=$((i+1))
+	done
+	jhdr; printf '{"ok":1,"codes":[%s]}' "$LIST"
+	exit 0;;
+
+vdel)
+	CODE=$(param code | tr 'a-z' 'A-Z')
+	is_code "$CODE" || err "Bad code"
+	sed -i "/^$CODE,/d" "$VFILE"
+	sed -i "/^$CODE,/d" "$PRFILE" 2>/dev/null
+	okj;;
+
+vreset)
+	CODE=$(param code | tr 'a-z' 'A-Z' | tr -d ' ')
+	is_code "$CODE" || err "Code must be 9 letters/numbers"
+	grep -q "^$CODE," "$VFILE" || err "Code not found"
+	awk -F',' -v c="$CODE" 'BEGIN{OFS=","} {if($1==c){$7=0} print}' "$VFILE" > "$VFILE.tmp" && mv "$VFILE.tmp" "$VFILE"
+	okj;;
+
+clients)
+	jhdr
+	ndsctl json 2>/dev/null || printf '{"clients":{}}'
+	exit 0;;
+
+deauth)
+	MAC=$(param mac)
+	is_mac "$MAC" || err "Invalid MAC address"
+	ndsctl deauth "$MAC" >/dev/null 2>&1
+	okj;;
+
+wl_list)
+	V=$(uci -q get opennds.@opennds[0].trustedmac 2>/dev/null)
+	jhdr; printf '{"ok":1,"macs":['
+	first=1
+	for m in $V; do
+		[ "$first" = "1" ] && first=0 || printf ','
+		printf '"%s"' "$m"
+	done
+	printf ']}'
+	exit 0;;
+
+wl_add)
+	MAC=$(param mac)
+	is_mac "$MAC" || err "Invalid MAC (format AA:BB:CC:DD:EE:FF)"
+	uci -q add_list opennds.@opennds[0].trustedmac="$MAC"
+	uci -q commit opennds
+	ndsctl trust "$MAC" >/dev/null 2>&1
+	okj;;
+
+wl_del)
+	MAC=$(param mac)
+	is_mac "$MAC" || err "Invalid MAC"
+	uci -q del_list opennds.@opennds[0].trustedmac="$MAC"
+	uci -q commit opennds
+	ndsctl untrust "$MAC" >/dev/null 2>&1
+	okj;;
+
+bw)
+	L=$(grep "$LANIF:" /proc/net/dev 2>/dev/null | head -n1 | tr ':' ' ')
+	RX=$(printf '%s' "$L" | awk '{print $2}')
+	TX=$(printf '%s' "$L" | awk '{print $10}')
+	jhdr; printf '{"ok":1,"rx":%s,"tx":%s,"t":%s}' "${RX:-0}" "${TX:-0}" "$(date +%s)"
+	exit 0;;
+
+backup)
+	printf 'Content-type: application/octet-stream\r\nContent-Disposition: attachment; filename="shamim-vouchers-backup.txt"\r\n\r\n'
+	cat "$VFILE"
+	exit 0;;
+
+restore)
+	DATA=$(param data)
+	printf '%s\n' "$DATA" | tr -d '\r' | grep -E '^[A-Za-z0-9-]+,[0-9]+,[0-9]+,[0-9]+,[0-9]+,[0-9]+,[0-9]+$' > "$VFILE.tmp"
+	N=$(grep -c . "$VFILE.tmp")
+	if [ "$N" -gt 0 ] 2>/dev/null; then
+		mv "$VFILE.tmp" "$VFILE"
+		jhdr; printf '{"ok":1,"count":%s}' "$N"
+	else
+		rm -f "$VFILE.tmp"
+		err "No valid voucher lines found in pasted text"
+	fi
+	exit 0;;
+
+chpass)
+	NID=$(param nid); NPW=$(param npw)
+	printf '%s' "$NID" | grep -qE '^[A-Za-z0-9_-]{3,32}$' || err "Router ID: 3-32 letters/numbers"
+	[ "${#NPW}" -ge 6 ] || err "Password minimum 6 characters"
+	printf '%s' "$NPW" | grep -qE '^[A-Za-z0-9@#%._-]+$' || err "Password: letters, numbers and @ # % . _ - only"
+	ADMIN_ID="$NID"; ADMIN_PW="$NPW"
+	write_cfg
+	okj;;
+
+setcfg)
+	NBRAND=$(param brand); NIF=$(param lanif)
+	printf '%s' "$NBRAND" | grep -qE '^[A-Za-z0-9 ._-]{1,30}$' || err "Brand: 1-30 letters/numbers/spaces"
+	printf '%s' "$NIF" | grep -qE '^[A-Za-z0-9._-]{1,20}$' || err "Interface name invalid"
+	LANIF="$NIF"; BRAND="$NBRAND"
+	write_cfg
+	okj;;
+
+cfg_all)
+	jhdr
+	printf '{"ok":1,"brand":"%s","lanif":"%s","tg_token":"%s","tg_chat":"%s","bkash":"%s","nagad":"%s","paynote":"%s","pmsg":"%s","rb_type":"%s","rb_hh":%s,"rb_mm":%s,"ver":"%s"}' \
+		"$(jesc "$BRAND")" "$(jesc "$LANIF")" "$(jesc "$TG_TOKEN")" "$(jesc "$TG_CHAT")" "$(jesc "$PAY_BKASH")" "$(jesc "$PAY_NAGAD")" "$(jesc "$PAY_NOTE")" "$(jesc "$PORTAL_MSG")" "$RB_TYPE" "${RB_HH:-4}" "${RB_MM:-0}" "$VERSION"
+	exit 0;;
+
+pk_list)
+	jhdr; printf '{"ok":1,"p":['
+	awk -F'|' 'NF>=5{printf "%s[\"%s\",%d,%d,%d,%d]", (c++?",":""), $1,$2,$3,$4,$5}' "$PKFILE" 2>/dev/null
+	printf ']}'
+	exit 0;;
+
+pk_add)
+	NM=$(param name); PR=$(param price); DOWN=$(param down); UP=$(param up); MINS=$(param mins)
+	printf '%s' "$NM" | grep -qE '^[A-Za-z0-9 ._-]{1,24}$' || err "Package name: 1-24 letters/numbers/spaces"
+	is_num "$PR" || err "Price must be a number (Taka)"
+	is_num "$DOWN" || DOWN=0
+	is_num "$UP" || UP=0
+	is_num "$MINS" || err "Validity minutes required"
+	[ "$MINS" -gt 0 ] || err "Validity must be more than 0"
+	grep -q "^$NM|" "$PKFILE" 2>/dev/null && err "Package name already exists"
+	printf '%s|%s|%s|%s|%s\n' "$NM" "$PR" "$DOWN" "$UP" "$MINS" >> "$PKFILE"
+	okj;;
+
+pk_del)
+	NM=$(param name)
+	[ -n "$NM" ] || err "Package name required"
+	grep -v "^$NM|" "$PKFILE" > "$PKFILE.tmp" 2>/dev/null
+	mv "$PKFILE.tmp" "$PKFILE"
+	okj;;
+
+insights)
+	NOW=$(date +%s)
+	E=$(awk -F',' -v now="$NOW" -v pf="$PRFILE" 'FILENAME==pf{if(NF>=2)pr[$1]=$2;next} NF>=7 && $7>0 {used++; earn+=pr[$1]; if(now-$7<604800)e7+=pr[$1]; if(now-$7<2592000)e30+=pr[$1]} END{printf "%d %d %d %d", earn+0,e7+0,e30+0,used+0}' "$PRFILE" "$VFILE")
+	set -- $E
+	jhdr
+	printf '{"ok":1,"earn":%s,"e7":%s,"e30":%s,"used":%s,"r":[' "${1:-0}" "${2:-0}" "${3:-0}" "${4:-0}"
+	awk -F',' -v pf="$PRFILE" 'FILENAME==pf{if(NF>=2)pr[$1]=$2;next} NF>=7 && $7>0 {print $7","$1","(pr[$1]+0)","$6}' "$PRFILE" "$VFILE" | sort -t',' -k1,1nr | head -n 12 | awk -F',' '{printf "%s[%d,\"%s\",%d,%d]", (c++?",":""), $1,$2,$3,$4}'
+	printf ']}'
+	exit 0;;
+
+tg_set)
+	T=$(param token); C=$(param chat)
+	printf '%s' "$T" | grep -qE '^[A-Za-z0-9:_-]{0,64}$' || err "Bot token: invalid characters"
+	printf '%s' "$C" | grep -qE '^-?[0-9]{0,20}$' || err "Chat ID must be a number"
+	TG_TOKEN="$T"; TG_CHAT="$C"
+	write_cfg
+	okj;;
+
+tg_test)
+	[ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ] || err "Save bot token and chat ID first"
+	R=$(wget -qO- "https://api.telegram.org/bot$TG_TOKEN/sendMessage?chat_id=$TG_CHAT&text=Panel%20test%20OK" 2>/dev/null)
+	case "$R" in
+	*'"ok":true'*) okj;;
+	*) err "Telegram not reachable - check token, chat ID and internet";;
+	esac
+	;;
+
+pay_set)
+	B=$(param bkash); N=$(param nagad); NT=$(param note)
+	printf '%s' "$B" | grep -qE '^[0-9+ -]{0,20}$' || err "bKash number: digits only"
+	printf '%s' "$N" | grep -qE '^[0-9+ -]{0,20}$' || err "Nagad number: digits only"
+	printf '%s' "$NT" | grep -qE '^[A-Za-z0-9 .,!?_-]{0,120}$' || err "Note: English letters/numbers only (max 120)"
+	PAY_BKASH="$B"; PAY_NAGAD="$N"; PAY_NOTE="$NT"
+	write_cfg
+	okj;;
+
+theme_set)
+	M=$(param msg)
+	printf '%s' "$M" | grep -qE '^[A-Za-z0-9 .,!?_-]{0,120}$' || err "Message: English letters/numbers only (max 120)"
+	PORTAL_MSG="$M"
+	write_cfg
+	okj;;
+
+cron_set)
+	TY=$(param type); HH=$(param hh); MM=$(param mm)
+	case "$TY" in disabled|daily) : ;; *) err "Schedule type invalid";; esac
+	is_num "$HH" && [ "$HH" -le 23 ] || err "Hour must be 0-23"
+	is_num "$MM" && [ "$MM" -le 59 ] || err "Minute must be 0-59"
+	RB_TYPE="$TY"; RB_HH="$HH"; RB_MM="$MM"
+	write_cfg
+	touch "$CRONF" 2>/dev/null
+	grep -v 'SHAMIM_AUTOREBOOT' "$CRONF" > "$CRONF.tmp" 2>/dev/null
+	[ "$TY" = "daily" ] && printf '%s %s * * * /sbin/reboot # SHAMIM_AUTOREBOOT\n' "$MM" "$HH" >> "$CRONF.tmp"
+	mv "$CRONF.tmp" "$CRONF"
+	/etc/init.d/cron restart >/dev/null 2>&1
+	okj;;
+
+factory_reset)
+	jhdr; printf '{"ok":1}'
+	( sleep 2; firstboot -y; reboot ) >/dev/null 2>&1 &
+	exit 0;;
+
+reboot_now)
+	jhdr; printf '{"ok":1}'
+	( sleep 2; reboot ) >/dev/null 2>&1 &
+	exit 0;;
+
+restart_nds)
+	jhdr; printf '{"ok":1}'
+	( sleep 1; /etc/init.d/opennds restart ) >/dev/null 2>&1 &
+	exit 0;;
+
+"") : ;;
+
+*)
+	err "Unknown action";;
+esac
+
+# ---------- default: serve the app ----------
+printf 'Content-type: text/html\r\n\r\n'
+cat <<'PAGEEOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SHAMIM WiFi - Admin Panel</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,'Segoe UI',Arial,sans-serif;background:#eaf5fb;color:#16394f;font-size:14px}
+#loginWrap{display:none;position:fixed;inset:0;background:#eaf5fb;z-index:50;align-items:center;justify-content:center}
+.login-card{background:#fff;border-radius:16px;box-shadow:0 10px 40px rgba(20,80,120,.15);padding:34px 30px;width:320px;text-align:center}
+.login-card h1{font-size:22px;margin:8px 0 2px}
+.login-card .sub{color:#6b93a8;font-size:12px;margin-bottom:18px}
+.brandmark{font-size:34px}
+.fld{text-align:left;margin-bottom:12px}
+.fld label{display:block;font-size:11px;font-weight:700;color:#5b87a0;letter-spacing:.5px;margin-bottom:4px;text-transform:uppercase}
+input,select,textarea{width:100%;padding:9px 11px;border:1px solid #cfe4ef;border-radius:9px;font-size:14px;background:#f8fcff;color:#16394f;outline:none}
+input:focus,select:focus,textarea:focus{border-color:#38b6e8}
+.btn{display:inline-block;border:0;border-radius:9px;padding:10px 16px;font-size:13px;font-weight:700;cursor:pointer;background:#0f9d8f;color:#fff}
+.btn:hover{filter:brightness(1.08)}
+.btn.blue{background:#2596d1}.btn.green{background:#3cb46e}.btn.red{background:#e05555}.btn.orange{background:#f0813f}.btn.yellow{background:#e0a821}
+.btn.ghost{background:#eaf5fb;color:#2596d1}
+.btn.sm{padding:5px 10px;font-size:12px;border-radius:7px}
+.btn.wide{width:100%}
+.err{color:#e05555;font-size:12px;min-height:16px;margin-top:6px}
+#app{display:none;min-height:100vh}
+.sidebar{width:210px;background:#f2fbff;border-right:1px solid #d8ecf5;position:fixed;top:0;bottom:0;left:0;padding:16px 10px;overflow-y:auto}
+.side-brand{font-weight:800;font-size:17px;color:#0e6ea8;padding:6px 8px 14px;display:flex;align-items:center;gap:7px}
+.side-brand .bm{font-size:22px}
+.mgroup{font-size:10px;font-weight:800;color:#8fb3c5;letter-spacing:1px;padding:10px 8px 4px;text-transform:uppercase}
+.mitem{display:flex;align-items:center;gap:8px;padding:9px 10px;border-radius:9px;color:#33607c;cursor:pointer;font-weight:600;margin-bottom:2px}
+.mitem:hover{background:#e2f4fd}
+.mitem.active{background:#cdeefd;color:#0e6ea8}
+.logout{margin-top:14px;color:#c04747;background:#fdeaea}
+.main{margin-left:210px;padding:26px 30px 60px;max-width:1150px}
+.pagehead{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;flex-wrap:wrap;gap:10px}
+.pagehead h1{font-size:24px}
+.pagehead .desc{color:#6b93a8;font-size:12px;margin-top:3px}
+.badge-on{background:#e5f9ee;color:#1f9d5b;font-weight:700;font-size:12px;padding:6px 12px;border-radius:99px}
+.page{display:none}
+.page.show{display:block}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-bottom:18px}
+.stat{border-radius:14px;padding:16px;color:#fff;box-shadow:0 6px 18px rgba(20,80,120,.12)}
+.stat .stat-t{font-size:11px;font-weight:800;letter-spacing:.5px;opacity:.9}
+.stat .stat-v{font-size:30px;font-weight:800;margin:6px 0}
+.stat .stat-s{font-size:11px;opacity:.85}
+.stat.blue{background:#35a4dd}.stat.green{background:#52bd77}.stat.orange{background:#ef7f4a}.stat.yellow{background:#e3ac2b}
+.chip{display:inline-block;font-size:11px;font-weight:700;border-radius:99px;padding:3px 9px}
+.chip.w{background:rgba(255,255,255,.25);color:#fff;margin-right:5px}
+.chip.blue{background:#dff1fb;color:#1d7fb5}.chip.green{background:#e2f7ea;color:#22995a}.chip.gray{background:#eceff1;color:#78909c}
+.card{background:#fff;border-radius:14px;padding:18px;box-shadow:0 4px 14px rgba(20,80,120,.08);margin-bottom:16px}
+.card h3{font-size:15px;margin-bottom:12px;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.card h3 .muted{font-weight:400;color:#8fb3c5;font-size:11px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:900px){.two{grid-template-columns:1fr}.main{margin-left:0;padding:16px}.sidebar{position:static;width:100%;display:flex;flex-wrap:wrap;gap:4px}.side-brand{width:100%} .mgroup{display:none}}
+.ccard{border-radius:14px;padding:18px;color:#fff;margin-bottom:16px}
+.ccard.orange{background:linear-gradient(135deg,#f0813f,#e8622e)}
+.ccard.blue{background:linear-gradient(135deg,#2f9fd8,#1b7fc4)}
+.ccard h3{color:#fff;font-size:15px;margin-bottom:12px}
+.ccard label{color:rgba(255,255,255,.9)!important}
+.ccard input,.ccard select{background:rgba(255,255,255,.95)}
+.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+table{width:100%;border-collapse:collapse}
+th{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:#78a0b5;text-align:left;padding:8px;border-bottom:1px solid #e4f0f6}
+td{padding:9px 8px;border-bottom:1px solid #eef6fa;font-size:13px}
+tr:hover td{background:#f7fcff}
+.code{font-family:ui-monospace,Consolas,monospace;font-weight:800;letter-spacing:1px}
+.tabs{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap}
+.tab{padding:7px 14px;border-radius:99px;background:#eef6fa;color:#4b7d94;font-weight:700;font-size:12px;cursor:pointer}
+.tab.active{background:#2596d1;color:#fff}
+.legend{font-size:11px;color:#6b93a8;margin-top:6px}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin:0 4px 0 10px}
+.dot.g{background:#7cc74f}.dot.b{background:#3aa4d8}
+canvas{width:100%}
+.toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(80px);background:#123c52;color:#fff;padding:11px 20px;border-radius:99px;font-weight:600;font-size:13px;opacity:0;transition:.25s;z-index:99;box-shadow:0 8px 26px rgba(0,0,0,.25)}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.toast.bad{background:#c04747}
+.note{font-size:12px;color:#6b93a8;margin-top:8px;line-height:1.5}
+.inline{display:flex;gap:8px;align-items:end;flex-wrap:wrap}
+.inline .fld{flex:1;min-width:130px;margin-bottom:0}
+</style>
+</head>
+<body>
+
+<div id="loginWrap">
+	<div class="login-card">
+		<div class="brandmark">&#128246;</div>
+		<h1 id="liBrand">SHAMIM WiFi</h1>
+		<div class="sub">Sign in to manage your SHAMIM WiFi Zone</div>
+		<div class="fld"><label>Router ID</label><input id="liId" placeholder="admin"></div>
+		<div class="fld"><label>Password</label><input id="liPw" type="password" placeholder="********" onkeydown="if(event.key==='Enter')doLogin()"></div>
+		<button class="btn wide" onclick="doLogin()">Sign In</button>
+		<div class="err" id="liErr"></div>
+	</div>
+</div>
+
+<div id="app">
+<div class="sidebar" style="overflow-y:auto">
+	<div class="side-brand"><span class="bm">&#128246;</span> <span id="brandName">SHAMIM WiFi</span></div>
+	<div class="mgroup">Core Monitor</div>
+	<div class="mitem active" data-pg="dash" onclick="nav('dash')">&#128200; Dashboard</div>
+	<div class="mitem" data-pg="users" onclick="nav('users')">&#128101; Active Users</div>
+	<div class="mgroup">Voucher Operations</div>
+	<div class="mitem" data-pg="vouchers" onclick="nav('vouchers')">&#127915; Vouchers</div>
+	<div class="mitem" data-pg="packages" onclick="nav('packages')">&#128230; Voucher Package</div>
+	<div class="mitem" data-pg="insights" onclick="nav('insights')">&#128202; Insights</div>
+	<div class="mgroup">System &amp; Finance</div>
+	<div class="mitem" data-pg="deposit" onclick="nav('deposit')">&#128179; Deposit &amp; Balance</div>
+	<div class="mitem" data-pg="theme" onclick="nav('theme')">&#127912; Portal Theme</div>
+	<div class="mitem" data-pg="telegram" onclick="nav('telegram')">&#128172; Telegram Bot</div>
+	<div class="mitem" data-pg="payment" onclick="nav('payment')">&#128181; Payment Integration</div>
+	<div class="mitem" data-pg="account" onclick="nav('account')">&#128100; Account</div>
+	<div class="mitem" data-pg="update" onclick="nav('update')">&#128260; Check Update</div>
+	<div class="mitem" data-pg="wl" onclick="nav('wl')">&#128737; Bridge Mode</div>
+	<div class="mitem" data-pg="reset" onclick="nav('reset')">&#128683; Reset MAC</div>
+	<div class="mitem" data-pg="settings" onclick="nav('settings')">&#9881; Settings</div>
+	<div class="mitem logout" onclick="doLogout()">&#128682; Logout Admin</div>
+</div>
+<div class="main">
+
+<div class="page show" id="pg-dash">
+	<div class="pagehead"><div><h1>System Monitor</h1><div class="desc">Real-time status and operational overview</div></div><span class="badge-on" id="routerBadge">&#9679; ROUTER ONLINE</span></div>
+	<div class="stats">
+		<div class="stat blue"><div class="stat-t">TOTAL VOUCHERS</div><div class="stat-v" id="stTotal">0</div><div><span class="chip w" id="chipA">Active: 0</span><span class="chip w" id="chipU">Unused: 0</span></div></div>
+		<div class="stat green"><div class="stat-t">ACTIVE VOUCHERS</div><div class="stat-v" id="stActive">0</div><div class="stat-s">running right now</div></div>
+		<div class="stat orange"><div class="stat-t">CONNECTED NOW</div><div class="stat-v" id="stConn">0</div><div class="stat-s">live devices on hotspot</div></div>
+		<div class="stat yellow"><div class="stat-t">UNUSED CODES</div><div class="stat-v" id="stUnused">0</div><div class="stat-s" id="stExpiredS">used/expired: 0</div></div>
+	</div>
+	<div class="card"><h3>&#128225; Bandwidth Monitoring <span class="muted">live LAN traffic</span></h3><canvas id="bwCanvas" height="170"></canvas><div class="legend"><span class="dot g"></span>Download <span class="dot b"></span>Upload</div></div>
+	<div class="card"><h3>&#128246; Connected Devices <button class="btn sm ghost" onclick="refreshDashDev()">&#8635; Refresh</button></h3><div id="dashDev"></div></div>
+</div>
+
+<div class="page" id="pg-users">
+	<div class="pagehead"><div><h1>Active Sessions</h1><div class="desc">Real-time status of current active sessions connected to your hotspot network</div></div><span class="badge-on" id="userCount">TOTAL CONNECTED: 0</span></div>
+	<div class="card"><h3>&#128101; Active Devices <button class="btn sm ghost" onclick="loadUsers()">&#8635; Refresh</button></h3><div id="userTable"></div></div>
+</div>
+
+<div class="page" id="pg-vouchers">
+	<div class="pagehead"><div><h1>Voucher Management</h1><div class="desc">Generate, print, and keep track of internet access vouchers</div></div><button class="btn green" onclick="printUnused()">&#128424; Print Unused</button></div>
+	<div class="two">
+		<div class="ccard orange">
+			<h3>&#9999; Manual Creation</h3>
+			<div id="pkQuick" style="margin-bottom:8px"></div>
+			<div class="fld"><label>Custom Voucher Code (9 chars, empty = auto)</label><input id="mcCode" maxlength="9" placeholder="E.G. NET500MB1" style="text-transform:uppercase"></div>
+			<div class="fld"><label>Price (Tk, for earnings &amp; printed card)</label><input id="mcP" type="number" min="0" value="0"></div>
+			<div class="grid4">
+				<div class="fld"><label>Days</label><input id="mcD" type="number" min="0" value="1"></div>
+				<div class="fld"><label>Hrs</label><input id="mcH" type="number" min="0" value="0"></div>
+				<div class="fld"><label>Mins</label><input id="mcM" type="number" min="0" value="0"></div>
+				<div class="fld"><label>Speed Limit</label><select id="mcS"></select></div>
+			</div>
+			<div style="margin-top:12px"><button class="btn wide" style="background:rgba(255,255,255,.22)" onclick="createOne()">&#10133; CREATE SINGLE VOUCHER</button></div>
+		</div>
+		<div class="ccard blue">
+			<h3>&#128218; Bulk Generation</h3>
+			<div class="fld"><label>Quantity (1 - 1000)</label><input id="bkQ" type="number" min="1" max="1000" value="10"></div>
+			<div class="fld"><label>Price per Voucher (Tk)</label><input id="bkP" type="number" min="0" value="0"></div>
+			<div class="grid4">
+				<div class="fld"><label>Days</label><input id="bkD" type="number" min="0" value="7"></div>
+				<div class="fld"><label>Hrs</label><input id="bkH" type="number" min="0" value="0"></div>
+				<div class="fld"><label>Mins</label><input id="bkM" type="number" min="0" value="0"></div>
+				<div class="fld"><label>Speed Limit</label><select id="bkS"></select></div>
+			</div>
+			<div style="margin-top:12px"><button class="btn wide" style="background:rgba(255,255,255,.22)" onclick="createBulk()">&#10024; GENERATE VOUCHER BATCH</button></div>
+		</div>
+	</div>
+	<div class="card">
+		<h3>All Vouchers <span class="inline" style="gap:6px"><input id="vPrice" placeholder="Price on card e.g. Tk 20" style="width:170px"><button class="btn sm ghost" onclick="loadVouchers()">&#8635; Refresh</button></span></h3>
+		<div class="tabs">
+			<div class="tab active" data-t="all" onclick="setTab('all')">All Vouchers</div>
+			<div class="tab" data-t="active" onclick="setTab('active')">Active Hotspots</div>
+			<div class="tab" data-t="unused" onclick="setTab('unused')">Unused Codes</div>
+			<div class="tab" data-t="used" onclick="setTab('used')">Used / Expired</div>
+		</div>
+		<div id="vTable"></div>
+	</div>
+</div>
+
+<div class="page" id="pg-reset">
+	<div class="pagehead"><div><h1>Reset Voucher MAC</h1><div class="desc">De-authorize a voucher so it can be used again on any other device</div></div></div>
+	<div class="card" style="max-width:430px">
+		<h3>&#128260; Reset Voucher Code</h3>
+		<div class="fld"><label>Voucher Code *</label><input id="rsCode" maxlength="9" placeholder="E.G. A182C3XYZ" style="text-transform:uppercase"></div>
+		<button class="btn blue wide" onclick="resetVoucher()">&#128260; RESET DEVICE MAC</button>
+		<div class="note">This marks the code as fresh/unused again. The customer can enter it on a new device. If the old device is still connected, also remove it from Active Users.</div>
+	</div>
+</div>
+
+<div class="page" id="pg-wl">
+	<div class="pagehead"><div><h1>Bridge Mode Whitelist</h1><div class="desc">Whitelist client MAC addresses to bypass the captive portal with unlimited speed and lifetime validity</div></div></div>
+	<div class="two">
+		<div class="card">
+			<h3>&#128737; Whitelist New Device</h3>
+			<div class="fld"><label>MAC Address *</label><input id="wlMac" placeholder="E.G. AA:BB:CC:DD:EE:FF"></div>
+			<button class="btn blue wide" onclick="wlAdd()">&#128246; CONNECT DEVICE</button>
+			<div class="note">Find a device MAC in Active Users, or in the phone WiFi settings.</div>
+		</div>
+		<div class="card"><h3>&#128203; Whitelisted Devices <button class="btn sm ghost" onclick="loadWl()">&#8635;</button></h3><div id="wlTable"></div></div>
+	</div>
+</div>
+
+<div class="page" id="pg-packages">
+	<div class="pagehead"><div><h1>Voucher Package</h1><div class="desc">Create ready-made packages (name, price, speed, validity) for one-click voucher creation</div></div></div>
+	<div class="two">
+		<div class="card">
+			<h3>&#128230; New Package</h3>
+			<div class="fld"><label>Package Name *</label><input id="pkName" maxlength="24" placeholder="E.G. 3 Days 10Mbps"></div>
+			<div class="fld"><label>Price (Tk) *</label><input id="pkPrice" type="number" min="0" value="20"></div>
+			<div class="grid4">
+				<div class="fld"><label>Days</label><input id="pkD" type="number" min="0" value="3"></div>
+				<div class="fld"><label>Hrs</label><input id="pkH" type="number" min="0" value="0"></div>
+				<div class="fld"><label>Mins</label><input id="pkM" type="number" min="0" value="0"></div>
+				<div class="fld"><label>Speed Limit</label><select id="pkS"></select></div>
+			</div>
+			<div style="margin-top:12px"><button class="btn blue wide" onclick="pkAdd()">&#10133; ADD PACKAGE</button></div>
+			<div class="note">Packages show as one-click buttons on the Vouchers page, and will appear on the customer portal in the portal update.</div>
+		</div>
+		<div class="card"><h3>&#128203; All Packages <button class="btn sm ghost" onclick="loadPk()">&#8635;</button></h3><div id="pkTable"></div></div>
+	</div>
+</div>
+
+<div class="page" id="pg-insights">
+	<div class="pagehead"><div><h1>Insights</h1><div class="desc">Earnings and sales overview of your hotspot business</div></div></div>
+	<div class="stats">
+		<div class="stat green"><div class="stat-t">TOTAL EARNINGS</div><div class="stat-v" id="inTotal">Tk 0</div><div class="stat-s">from used vouchers</div></div>
+		<div class="stat blue"><div class="stat-t">LAST 7 DAYS</div><div class="stat-v" id="in7">Tk 0</div><div class="stat-s">weekly earnings</div></div>
+		<div class="stat orange"><div class="stat-t">LAST 30 DAYS</div><div class="stat-v" id="in30">Tk 0</div><div class="stat-s">monthly earnings</div></div>
+		<div class="stat yellow"><div class="stat-t">VOUCHERS SOLD</div><div class="stat-v" id="inUsed">0</div><div class="stat-s">codes used by customers</div></div>
+	</div>
+	<div class="card"><h3>&#129297; Recent Sales <button class="btn sm ghost" onclick="loadInsights()">&#8635;</button></h3><div id="inTable"></div>
+	<div class="note">A sale is counted when a customer uses a voucher that was created with a price. Set the price when creating vouchers.</div></div>
+</div>
+
+<div class="page" id="pg-deposit">
+	<div class="pagehead"><div><h1>Deposit &amp; Balance</h1><div class="desc">Account balance and billing for this panel</div></div></div>
+	<div class="stats">
+		<div class="stat green"><div class="stat-t">PANEL FEE</div><div class="stat-v">Tk 0</div><div class="stat-s">forever - self hosted</div></div>
+		<div class="stat blue"><div class="stat-t">DEPOSIT NEEDED</div><div class="stat-v">None</div><div class="stat-s">no balance system</div></div>
+		<div class="stat orange"><div class="stat-t">YOUR EARNINGS</div><div class="stat-v" id="depEarn">Tk 0</div><div class="stat-s">see Insights for details</div></div>
+	</div>
+	<div class="card"><h3>&#127881; 100% Free Panel</h3>
+	<div class="note">This panel runs on your own router, so there is no monthly fee, no deposit and no balance - unlike SaaS providers. Everything you earn is yours.</div></div>
+</div>
+
+<div class="page" id="pg-theme">
+	<div class="pagehead"><div><h1>Portal Theme</h1><div class="desc">Customize what customers see on the WiFi login portal</div></div></div>
+	<div class="card" style="max-width:520px">
+		<h3>&#127912; Portal Settings</h3>
+		<div class="fld"><label>Portal Welcome Message (English)</label><input id="thMsg" maxlength="120" placeholder="Welcome to SHAMIM WiFi - Buy a voucher to get online"></div>
+		<button class="btn blue wide" onclick="themeSave()">&#128190; SAVE PORTAL THEME</button>
+		<div class="note">Brand name is set in Settings. The message is stored now and gets applied to the customer portal page in the portal update (next phase).</div>
+	</div>
+</div>
+
+<div class="page" id="pg-telegram">
+	<div class="pagehead"><div><h1>Telegram Bot</h1><div class="desc">Get panel notifications in your Telegram</div></div></div>
+	<div class="card" style="max-width:520px">
+		<h3>&#128172; Bot Configuration</h3>
+		<div class="fld"><label>Bot Token (from @BotFather)</label><input id="tgToken" placeholder="123456789:AAAA..."></div>
+		<div class="fld"><label>Chat ID (from @userinfobot)</label><input id="tgChat" placeholder="123456789"></div>
+		<div class="inline">
+			<button class="btn blue" onclick="tgSave()">&#128190; SAVE</button>
+			<button class="btn green" onclick="tgTest()">&#128228; SEND TEST MESSAGE</button>
+		</div>
+		<div class="note">In Telegram, message @BotFather and send /newbot to create a bot, copy its token. Then message @userinfobot to get your Chat ID. Router must have internet.</div>
+	</div>
+</div>
+
+<div class="page" id="pg-payment">
+	<div class="pagehead"><div><h1>Payment Integration</h1><div class="desc">Configure hotspot payment channels shown to customers</div></div></div>
+	<div class="card" style="max-width:520px">
+		<h3>&#128181; Manual Payment (bKash / Nagad)</h3>
+		<div class="inline">
+			<div class="fld"><label>bKash Number (Personal)</label><input id="pyBkash" placeholder="01XXXXXXXXX"></div>
+			<div class="fld"><label>Nagad Number (Personal)</label><input id="pyNagad" placeholder="01XXXXXXXXX"></div>
+		</div>
+		<div class="fld"><label>Instruction Note (English)</label><input id="pyNote" maxlength="120" placeholder="Send money then SMS the TrxID to 01XXXXXXXXX"></div>
+		<button class="btn blue wide" onclick="paySave()">&#128190; SAVE PAYMENT SETTINGS</button>
+		<div class="note">These numbers are stored now and will show on the customer portal in the portal update. Automatic bKash/Nagad API verification needs a merchant account - manual send-money + TrxID works for everyone.</div>
+	</div>
+</div>
+
+<div class="page" id="pg-account">
+	<div class="pagehead"><div><h1>Account</h1><div class="desc">Admin login credentials for this panel</div></div></div>
+	<div class="card" style="max-width:520px"><h3>&#128273; Admin Credentials</h3>
+		<div class="inline">
+			<div class="fld"><label>New Router ID</label><input id="cpId"></div>
+			<div class="fld"><label>New Password (min 6)</label><input id="cpPw" type="password"></div>
+		</div>
+		<button class="btn red" onclick="chPass()">&#128273; CHANGE LOGIN</button>
+		<div class="note">After changing, you will be signed out and must log in with the new ID and password.</div>
+	</div>
+</div>
+
+<div class="page" id="pg-update">
+	<div class="pagehead"><div><h1>Check Update</h1><div class="desc">Panel version information</div></div></div>
+	<div class="card" style="max-width:430px">
+		<h3>&#128260; SHAMIM WiFi Panel</h3>
+		<div class="stat blue" style="margin:10px 0"><div class="stat-t">CURRENT VERSION</div><div class="stat-v" id="upVer">v1.1</div></div>
+		<button class="btn blue wide" onclick="toast('You are running the latest version')">&#128260; CHECK FOR UPDATES</button>
+		<div class="note">Updates are installed by replacing the file /www/cgi-bin/shamim with a newer version - your vouchers, packages and settings are kept.</div>
+	</div>
+</div>
+
+<div class="page" id="pg-settings">
+	<div class="pagehead"><div><h1>System Settings</h1><div class="desc">Configure system backup, auto reboot and hardware control actions</div></div></div>
+	<div class="card"><h3>&#128295; Hardware Control Actions</h3>
+		<button class="btn blue" onclick="rebootNow()">&#128268; REBOOT SYSTEM</button>
+		<button class="btn orange" onclick="restartNds()">&#128260; RESTART PORTAL (openNDS)</button>
+		<button class="btn red" onclick="factoryReset()">&#9888; FACTORY RESET ROUTER</button>
+	</div>
+	<div class="card"><h3>&#128190; Data Management Tools</h3>
+		<button class="btn blue" onclick="window.open(API+'?action=backup')">&#11015; DOWNLOAD BACKUP</button>
+		<div class="note">Backup contains the full voucher roll (vouchers.txt).</div>
+		<div class="fld" style="margin-top:10px"><label>Restore: paste backup content here</label><textarea id="rsData" rows="4" placeholder="CODE12345,0,0,0,0,1440,0"></textarea></div>
+		<button class="btn green" onclick="restoreData()">&#11014; RESTORE DATA</button>
+	</div>
+	<div class="card"><h3>&#127912; Brand &amp; Network</h3>
+		<div class="inline">
+			<div class="fld"><label>Brand Name</label><input id="cfBrand"></div>
+			<div class="fld"><label>LAN Interface</label><input id="cfIf" placeholder="br-lan"></div>
+			<button class="btn" onclick="saveCfg()">SAVE</button>
+		</div>
+	</div>
+	<div class="card"><h3>&#9200; Schedule Auto Reboot Configuration</h3>
+		<div class="inline">
+			<div class="fld"><label>Schedule Type</label><select id="rbType"><option value="disabled">Disabled</option><option value="daily">Daily</option></select></div>
+			<div class="fld"><label>Hour (0-23)</label><input id="rbHH" type="number" min="0" max="23" value="4"></div>
+			<div class="fld"><label>Minute (0-59)</label><input id="rbMM" type="number" min="0" max="59" value="0"></div>
+			<button class="btn blue" onclick="cronSave()">SAVE REBOOT SCHEDULE</button>
+		</div>
+		<div class="note">Set auto reboot schedule for best router performance.</div>
+	</div>
+</div>
+
+</div>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+var API = location.pathname;
+var BRAND = 'SHAMIM WiFi';
+function $(i){return document.getElementById(i);}
+function toast(m,bad){var t=$('toast');t.textContent=m;t.className='toast show'+(bad?' bad':'');setTimeout(function(){t.className='toast';},3200);}
+
+function api(a,d){
+	var body=new URLSearchParams(d||{}).toString();
+	return fetch(API+'?action='+a,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})
+	.then(function(r){return r.json();})
+	.then(function(j){ if(j&&j.auth){showLogin();throw new Error('auth');} return j; });
+}
+
+/* ---------- login ---------- */
+function showLogin(){ stopTimers(); $('loginWrap').style.display='flex'; $('app').style.display='none'; }
+function showApp(){ $('loginWrap').style.display='none'; $('app').style.display='block'; nav('dash'); }
+function doLogin(){
+	fetch(API+'?action=login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({id:$('liId').value,pw:$('liPw').value}).toString()})
+	.then(function(r){return r.json();})
+	.then(function(j){ if(j.ok){$('liErr').textContent='';showApp();} else {$('liErr').textContent=j.err||'Login failed';} })
+	.catch(function(){ $('liErr').textContent='Cannot reach router'; });
+}
+function doLogout(){ api('logout').then(function(){ showLogin(); }); }
+function boot(){
+	fetch(API+'?action=stats',{method:'POST'}).then(function(r){return r.json();})
+	.then(function(j){ if(j.ok){applyBrand(j);showApp();} else showLogin(); })
+	.catch(function(){ showLogin(); });
+}
+function applyBrand(s){ if(s.brand){ BRAND=s.brand; $('brandName').textContent=s.brand; $('liBrand').textContent=s.brand; document.title=s.brand+' - Admin Panel'; } }
+
+/* ---------- nav / timers ---------- */
+var timers=[];
+function stopTimers(){ timers.forEach(clearInterval); timers=[]; }
+function nav(p){
+	stopTimers();
+	var items=document.querySelectorAll('.mitem');
+	for(var i=0;i<items.length;i++){ items[i].className=items[i].className.replace(' active','');
+		if(items[i].getAttribute('data-pg')===p) items[i].className+=' active'; }
+	var pages=document.querySelectorAll('.page');
+	for(var j=0;j<pages.length;j++) pages[j].className='page';
+	$('pg-'+p).className='page show';
+	if(p==='dash') loadDash();
+	if(p==='users'){ loadUsers(); timers.push(setInterval(loadUsers,5000)); }
+	if(p==='vouchers'){ loadVouchers(); api('pk_list').then(function(j){PKDATA=j.p||[];fillPkQuick();}); }
+	if(p==='wl') loadWl();
+	if(p==='settings') loadSettings();
+	if(p==='packages') loadPk();
+	if(p==='insights') loadInsights();
+	if(p==='deposit') loadDeposit();
+	if(p==='theme'||p==='telegram'||p==='payment'||p==='update') loadCfgPages();
+}
+
+/* ---------- format helpers ---------- */
+function fmtSpeed(k){ k=+k; if(!k) return 'Unlimited'; return k>=1000 ? (k/1000)+' Mbps' : k+' kb/s'; }
+function fmtDur(m){ m=+m; var d=Math.floor(m/1440),h=Math.floor((m%1440)/60),mm=m%60,s='';
+	if(d)s+=d+'d '; if(h)s+=h+'h '; if(mm)s+=mm+'m'; return s.trim()||'0m'; }
+function fmtRemain(sec){ if(sec<0)sec=0; var d=Math.floor(sec/86400),h=Math.floor((sec%86400)/3600),m=Math.floor((sec%3600)/60);
+	if(d) return d+'d '+h+'h left'; if(h) return h+'h '+m+'m left'; return m+'m left'; }
+function fmtBytes(b){ b=+b||0; if(b>1073741824) return (b/1073741824).toFixed(2)+' GB'; if(b>1048576) return (b/1048576).toFixed(1)+' MB'; if(b>1024) return (b/1024).toFixed(0)+' kB'; return b+' B'; }
+function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+var SPEEDS=[[0,'Unlimited'],[2000,'2 Mbps'],[5000,'5 Mbps'],[10000,'10 Mbps'],[15000,'15 Mbps'],[20000,'20 Mbps'],[30000,'30 Mbps'],[50000,'50 Mbps']];
+function fillSpeeds(){ ['mcS','bkS','pkS'].forEach(function(id){ var el=$(id),h='';
+	SPEEDS.forEach(function(s){ h+='<option value="'+s[0]+'">'+s[1]+'</option>'; }); el.innerHTML=h; }); }
+
+/* ---------- clients ---------- */
+function getClients(){
+	return api('clients').then(function(j){
+		var list=[],cs=j.clients||{};
+		for(var k in cs){ var c=cs[k]; if(c&&typeof c==='object'){ if(!c.mac)c.mac=k; list.push(c);} }
+		return list;
+	});
+}
+function clientRows(list,withBtn){
+	if(!list.length) return '<div class="note" style="text-align:center;padding:20px">No live devices currently connected.</div>';
+	var h='<table><tr><th>#</th><th>MAC</th><th>IP Address</th><th>State</th><th>Downloaded</th><th>Uploaded</th>'+(withBtn?'<th>Action</th>':'')+'</tr>';
+	list.forEach(function(c,i){
+		h+='<tr><td>'+(i+1)+'</td><td class="code">'+esc(c.mac)+'</td><td>'+esc(c.ip||'')+'</td><td>'+esc(c.state||'')+'</td>'+
+		'<td>'+fmtBytes((+c.downloaded||0)*1024)+'</td><td>'+fmtBytes((+c.uploaded||0)*1024)+'</td>'+
+		(withBtn?'<td><button class="btn sm red" onclick="deauth(\''+esc(c.mac)+'\')">Disconnect</button> <button class="btn sm ghost" onclick="$(\'wlMac\').value=\''+esc(c.mac)+'\';nav(\'wl\')">Whitelist</button></td>':'')+'</tr>';
+	});
+	return h+'</table>';
+}
+
+/* ---------- dashboard ---------- */
+function loadDash(){
+	api('stats').then(function(s){
+		applyBrand(s);
+		$('stTotal').textContent=s.total; $('stActive').textContent=s.active; $('stUnused').textContent=s.unused;
+		$('chipA').textContent='Active: '+s.active; $('chipU').textContent='Unused: '+s.unused;
+		$('stExpiredS').textContent='used/expired: '+s.expired;
+	});
+	refreshDashDev();
+	bwD=[];bwU=[];bwPrev=null;
+	timers.push(setInterval(pollBw,2000));
+	pollBw();
+}
+function refreshDashDev(){
+	getClients().then(function(list){ $('stConn').textContent=list.length; $('dashDev').innerHTML=clientRows(list,false); })
+	.catch(function(){});
+}
+
+/* ---------- bandwidth graph ---------- */
+var bwPrev=null,bwD=[],bwU=[];
+function pollBw(){
+	api('bw').then(function(b){
+		if(bwPrev && b.t>bwPrev.t){
+			var dt=b.t-bwPrev.t;
+			bwD.push(Math.max(0,(b.rx-bwPrev.rx)*8/dt/1e6));
+			bwU.push(Math.max(0,(b.tx-bwPrev.tx)*8/dt/1e6));
+			if(bwD.length>45){bwD.shift();bwU.shift();}
+			drawBw();
+		}
+		bwPrev=b;
+	}).catch(function(){});
+}
+function drawBw(){
+	var cv=$('bwCanvas'); if(!cv) return;
+	cv.width=cv.clientWidth||800;
+	var w=cv.width,h=cv.height,ctx=cv.getContext('2d');
+	ctx.clearRect(0,0,w,h);
+	var mx=0.5; bwD.concat(bwU).forEach(function(v){ if(v>mx)mx=v; });
+	ctx.strokeStyle='#e4f0f6'; ctx.fillStyle='#8fb3c5'; ctx.font='10px sans-serif';
+	for(var g=0;g<=4;g++){ var y=h-8-(h-24)*g/4;
+		ctx.beginPath(); ctx.moveTo(34,y); ctx.lineTo(w-4,y); ctx.stroke();
+		ctx.fillText((mx*g/4).toFixed(1),2,y+3); }
+	function line(arr,col){
+		if(arr.length<2) return;
+		ctx.strokeStyle=col; ctx.lineWidth=2; ctx.beginPath();
+		arr.forEach(function(v,i){
+			var x=34+(w-40)*i/(45-1), y=h-8-(h-24)*(v/mx);
+			i?ctx.lineTo(x,y):ctx.moveTo(x,y);
+		});
+		ctx.stroke();
+	}
+	line(bwD,'#7cc74f'); line(bwU,'#3aa4d8');
+}
+
+/* ---------- active users ---------- */
+function loadUsers(){
+	getClients().then(function(list){
+		$('userCount').textContent='TOTAL CONNECTED: '+list.length;
+		$('userTable').innerHTML=clientRows(list,true);
+	}).catch(function(){});
+}
+function deauth(mac){
+	if(!confirm('Disconnect '+mac+' ?')) return;
+	api('deauth',{mac:mac}).then(function(j){ j.ok?toast('Device disconnected'):toast(j.err,true); loadUsers(); });
+}
+
+/* ---------- vouchers ---------- */
+var VDATA=[],VNOW=0,VTAB='all';
+function loadVouchers(){
+	api('vlist').then(function(j){ VDATA=j.v||[]; VNOW=j.now; renderV(); });
+}
+function setTab(t){ VTAB=t;
+	var tabs=document.querySelectorAll('.tab');
+	for(var i=0;i<tabs.length;i++) tabs[i].className='tab'+(tabs[i].getAttribute('data-t')===t?' active':'');
+	renderV();
+}
+function vstat(v){
+	if(+v[6]===0) return ['unused','Unused','chip blue'];
+	var exp=+v[6]+v[5]*60;
+	if(VNOW<exp) return ['active','Active &#8226; '+fmtRemain(exp-VNOW),'chip green'];
+	return ['used','Used / Expired','chip gray'];
+}
+function renderV(){
+	var rows='',n=0;
+	VDATA.forEach(function(v){
+		var st=vstat(v);
+		if(VTAB!=='all'&&st[0]!==VTAB) return;
+		n++;
+		rows+='<tr><td>'+n+'</td><td class="code">'+esc(v[0])+'</td><td>'+fmtSpeed(v[1])+'</td><td>'+fmtDur(v[5])+'</td><td><span class="'+st[2]+'">'+st[1]+'</span></td>'+
+		'<td><button class="btn sm ghost" onclick="printCodes([\''+esc(v[0])+'\'])">&#128424;</button> '+
+		'<button class="btn sm yellow" onclick="resetOne(\''+esc(v[0])+'\')">Reset</button> '+
+		'<button class="btn sm red" onclick="delOne(\''+esc(v[0])+'\')">&#10005;</button></td></tr>';
+	});
+	$('vTable').innerHTML = n? '<table><tr><th>#</th><th>Code</th><th>Speed</th><th>Validity</th><th>Status</th><th>Actions</th></tr>'+rows+'</table>'
+		: '<div class="note" style="text-align:center;padding:20px">No vouchers found in this tab.</div>';
+}
+function mins3(d,h,m){ return (+($(d).value)||0)*1440 + (+($(h).value)||0)*60 + (+($(m).value)||0); }
+function createOne(){
+	var mins=mins3('mcD','mcH','mcM');
+	if(mins<=0) return toast('Set a validity time',true);
+	api('vcreate',{code:$('mcCode').value.trim(),down:$('mcS').value,up:$('mcS').value,mins:mins,price:$('mcP').value||0})
+	.then(function(j){
+		if(!j.ok) return toast(j.err,true);
+		$('mcCode').value='';
+		toast('Voucher created: '+j.codes[0]);
+		loadVouchers();
+		if(confirm('Print this voucher now?')) printCodes(j.codes);
+	});
+}
+function createBulk(){
+	var mins=mins3('bkD','bkH','bkM');
+	if(mins<=0) return toast('Set a validity time',true);
+	api('vbulk',{qty:$('bkQ').value,down:$('bkS').value,up:$('bkS').value,mins:mins,price:$('bkP').value||0})
+	.then(function(j){
+		if(!j.ok) return toast(j.err,true);
+		toast(j.codes.length+' vouchers generated');
+		loadVouchers();
+		if(confirm('Print all '+j.codes.length+' new vouchers now?')) printCodes(j.codes);
+	});
+}
+function delOne(c){ if(!confirm('Delete voucher '+c+' ?')) return;
+	api('vdel',{code:c}).then(function(j){ j.ok?toast('Deleted'):toast(j.err,true); loadVouchers(); }); }
+function resetOne(c){ if(!confirm('Reset '+c+' to unused? The code will work again on any device.')) return;
+	api('vreset',{code:c}).then(function(j){ j.ok?toast('Voucher reset - usable again'):toast(j.err,true); loadVouchers(); }); }
+function resetVoucher(){
+	var c=$('rsCode').value.trim().toUpperCase();
+	if(!c) return toast('Enter a voucher code',true);
+	api('vreset',{code:c}).then(function(j){ if(j.ok){toast('Voucher reset - usable again');$('rsCode').value='';} else toast(j.err,true); });
+}
+function printUnused(){
+	var codes=[],meta={};
+	VDATA.forEach(function(v){ if(+v[6]===0){ codes.push(v[0]); meta[v[0]]=v; } });
+	if(!codes.length) return toast('No unused vouchers to print',true);
+	printCodes(codes);
+}
+function findV(c){ for(var i=0;i<VDATA.length;i++) if(VDATA[i][0]===c) return VDATA[i]; return null; }
+function printCodes(codes){
+	var price=$('vPrice')?$('vPrice').value.trim():'';
+	var cards='';
+	codes.forEach(function(c,i){
+		var v=findV(c), sp=v?fmtSpeed(v[1]):'', du=v?fmtDur(v[5]):'';
+		cards+='<div class="vc"><div class="vb">'+esc(BRAND)+'</div><div class="vt">WiFi VOUCHER '+(price?'&#8226; '+esc(price):'')+'</div>'+
+		'<div class="vcode">'+esc(c)+'</div>'+
+		'<div class="vm">'+(sp?'Speed: '+sp+' &nbsp;&#8226;&nbsp; ':'')+(du?'Validity: '+du:'')+'</div>'+
+		'<div class="vf">Connect to WiFi &#8594; enter this code &#8594; enjoy!</div><div class="vn">#'+(i+1)+'</div></div>';
+	});
+	var w=window.open('','_blank');
+	w.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8"><title>'+esc(BRAND)+' Vouchers</title><style>'+
+	'body{font-family:Arial,sans-serif;margin:8mm}'+
+	'.wrap{display:grid;grid-template-columns:repeat(4,1fr);gap:4mm}'+
+	'.vc{border:1.6px dashed #666;border-radius:8px;padding:9px 8px;text-align:center;page-break-inside:avoid;position:relative}'+
+	'.vb{font-weight:800;font-size:12px;color:#0e6ea8}'+
+	'.vt{font-size:9px;color:#555;margin:2px 0 5px;letter-spacing:.5px}'+
+	'.vcode{font-family:monospace;font-size:17px;font-weight:800;letter-spacing:2px;border:1.4px solid #222;border-radius:6px;padding:5px 2px;margin-bottom:5px}'+
+	'.vm{font-size:9px;color:#333}'+
+	'.vf{font-size:8px;color:#777;margin-top:4px}'+
+	'.vn{position:absolute;top:3px;right:6px;font-size:8px;color:#aaa}'+
+	'@media print{.noprint{display:none}}'+
+	'</style></head><body><div class="noprint" style="margin-bottom:8px"><button onclick="window.print()">Print</button></div><div class="wrap">'+cards+'</div></body></html>');
+	w.document.close();
+	setTimeout(function(){ try{w.print();}catch(e){} },400);
+}
+
+/* ---------- whitelist ---------- */
+function loadWl(){
+	api('wl_list').then(function(j){
+		var m=j.macs||[];
+		if(!m.length){ $('wlTable').innerHTML='<div class="note" style="text-align:center;padding:16px">No Whitelisted Devices<br>Whitelist specific devices to give them unlimited internet access instantly.</div>'; return; }
+		var h='<table><tr><th>#</th><th>MAC Address</th><th>Status</th><th>Action</th></tr>';
+		m.forEach(function(x,i){ h+='<tr><td>'+(i+1)+'</td><td class="code">'+esc(x)+'</td><td><span class="chip green">Trusted</span></td><td><button class="btn sm red" onclick="wlDel(\''+esc(x)+'\')">Remove</button></td></tr>'; });
+		$('wlTable').innerHTML=h+'</table>';
+	});
+}
+function wlAdd(){
+	var mac=$('wlMac').value.trim();
+	api('wl_add',{mac:mac}).then(function(j){
+		if(j.ok){ toast('Device whitelisted'); $('wlMac').value=''; loadWl(); } else toast(j.err,true);
+	});
+}
+function wlDel(mac){ if(!confirm('Remove '+mac+' from whitelist?')) return;
+	api('wl_del',{mac:mac}).then(function(j){ j.ok?toast('Removed'):toast(j.err,true); loadWl(); }); }
+
+/* ---------- settings ---------- */
+function loadSettings(){
+	api('stats').then(function(s){ $('cfBrand').value=s.brand||''; $('cfIf').value=s.lanif||'br-lan'; });
+	api('cfg_all').then(function(j){ $('rbType').value=j.rb_type||'disabled'; $('rbHH').value=j.rb_hh; $('rbMM').value=j.rb_mm; });
+}
+function saveCfg(){
+	api('setcfg',{brand:$('cfBrand').value.trim(),lanif:$('cfIf').value.trim()})
+	.then(function(j){ if(j.ok){toast('Saved');loadDash;api('stats').then(applyBrand);} else toast(j.err,true); });
+}
+function chPass(){
+	if(!confirm('Change admin login? You will need to sign in again.')) return;
+	api('chpass',{nid:$('cpId').value.trim(),npw:$('cpPw').value})
+	.then(function(j){ if(j.ok){toast('Credentials changed - sign in again'); doLogout();} else toast(j.err,true); });
+}
+function restoreData(){
+	if(!confirm('Replace the whole voucher list with pasted data?')) return;
+	api('restore',{data:$('rsData').value}).then(function(j){
+		if(j.ok){ toast(j.count+' vouchers restored'); $('rsData').value=''; } else toast(j.err,true);
+	});
+}
+function rebootNow(){
+	if(!confirm('Reboot the router now? WiFi will be down ~2 minutes.')) return;
+	api('reboot_now').then(function(){ toast('Rebooting... wait 2 minutes'); });
+}
+function restartNds(){
+	if(!confirm('Restart the captive portal? All customers must re-enter their codes.')) return;
+	api('restart_nds').then(function(){ toast('Portal restarting...'); });
+}
+
+/* ---------- packages ---------- */
+var PKDATA=[];
+function loadPk(){
+	api('pk_list').then(function(j){
+		PKDATA=j.p||[];
+		var rows='';
+		PKDATA.forEach(function(p,i){
+			rows+='<tr><td>'+(i+1)+'</td><td>'+esc(p[0])+'</td><td>Tk '+p[1]+'</td><td>'+fmtSpeed(p[2])+'</td><td>'+fmtDur(p[4])+'</td>'+
+			'<td><button class="btn sm red" onclick="pkDel(\''+esc(p[0])+'\')">&#10005;</button></td></tr>';
+		});
+		$('pkTable').innerHTML=PKDATA.length?'<table><tr><th>#</th><th>Name</th><th>Price</th><th>Speed</th><th>Validity</th><th>Del</th></tr>'+rows+'</table>':'<div class="note" style="text-align:center;padding:20px">No packages yet. Create the first one.</div>';
+		fillPkQuick();
+	});
+}
+function fillPkQuick(){
+	var h='';
+	PKDATA.forEach(function(p){ h+='<button class="btn sm ghost" style="margin:0 6px 6px 0" onclick="usePk(\''+esc(p[0])+'\')">'+esc(p[0])+' - Tk '+p[1]+'</button>'; });
+	if($('pkQuick')) $('pkQuick').innerHTML=h;
+}
+function usePk(name){
+	for(var i=0;i<PKDATA.length;i++){ var p=PKDATA[i]; if(p[0]===name){
+		var m=+p[4];
+		$('mcD').value=Math.floor(m/1440); $('mcH').value=Math.floor((m%1440)/60); $('mcM').value=m%60;
+		$('mcS').value=p[2]; $('mcP').value=p[1];
+		$('bkD').value=Math.floor(m/1440); $('bkH').value=Math.floor((m%1440)/60); $('bkM').value=m%60;
+		$('bkS').value=p[2]; $('bkP').value=p[1];
+		toast('Package applied: '+name);
+	}}
+}
+function pkAdd(){
+	var mins=mins3('pkD','pkH','pkM');
+	if(mins<=0) return toast('Set a validity time',true);
+	api('pk_add',{name:$('pkName').value.trim(),price:$('pkPrice').value||0,down:$('pkS').value,up:$('pkS').value,mins:mins})
+	.then(function(j){ if(j.ok){toast('Package added');$('pkName').value='';loadPk();} else toast(j.err,true); });
+}
+function pkDel(n){ if(!confirm('Delete package '+n+' ?')) return;
+	api('pk_del',{name:n}).then(function(j){ j.ok?toast('Deleted'):toast(j.err,true); loadPk(); }); }
+
+/* ---------- insights / deposit ---------- */
+function loadInsights(){
+	api('insights').then(function(j){
+		$('inTotal').textContent='Tk '+(j.earn||0);
+		$('in7').textContent='Tk '+(j.e7||0);
+		$('in30').textContent='Tk '+(j.e30||0);
+		$('inUsed').textContent=j.used||0;
+		var rows='';
+		(j.r||[]).forEach(function(r){
+			var d=new Date(r[0]*1000);
+			rows+='<tr><td>'+d.toLocaleString()+'</td><td class="code">'+esc(r[1])+'</td><td>Tk '+r[2]+'</td><td>'+fmtDur(r[3])+'</td></tr>';
+		});
+		$('inTable').innerHTML=rows?'<table><tr><th>Used At</th><th>Code</th><th>Price</th><th>Validity</th></tr>'+rows+'</table>':'<div class="note" style="text-align:center;padding:20px">No sales yet. Create vouchers with a price - when a customer uses one, it shows here.</div>';
+	});
+}
+function loadDeposit(){ api('insights').then(function(j){ $('depEarn').textContent='Tk '+(j.earn||0); }); }
+
+/* ---------- theme / telegram / payment / update ---------- */
+function loadCfgPages(){
+	api('cfg_all').then(function(j){
+		$('thMsg').value=j.pmsg||'';
+		$('tgToken').value=j.tg_token||'';
+		$('tgChat').value=j.tg_chat||'';
+		$('pyBkash').value=j.bkash||'';
+		$('pyNagad').value=j.nagad||'';
+		$('pyNote').value=j.paynote||'';
+		$('rbType').value=j.rb_type||'disabled';
+		$('rbHH').value=j.rb_hh;
+		$('rbMM').value=j.rb_mm;
+		$('upVer').textContent='v'+(j.ver||'1.1');
+	});
+}
+function themeSave(){ api('theme_set',{msg:$('thMsg').value.trim()}).then(function(j){ j.ok?toast('Portal theme saved'):toast(j.err,true); }); }
+function tgSave(){ api('tg_set',{token:$('tgToken').value.trim(),chat:$('tgChat').value.trim()}).then(function(j){ j.ok?toast('Telegram settings saved'):toast(j.err,true); }); }
+function tgTest(){ toast('Sending test message...'); api('tg_test').then(function(j){ j.ok?toast('Test message sent - check Telegram'):toast(j.err,true); }); }
+function paySave(){ api('pay_set',{bkash:$('pyBkash').value.trim(),nagad:$('pyNagad').value.trim(),note:$('pyNote').value.trim()}).then(function(j){ j.ok?toast('Payment settings saved'):toast(j.err,true); }); }
+function cronSave(){
+	api('cron_set',{type:$('rbType').value,hh:$('rbHH').value,mm:$('rbMM').value})
+	.then(function(j){ j.ok?toast('Reboot schedule saved'):toast(j.err,true); });
+}
+function factoryReset(){
+	if(!confirm('FACTORY RESET will erase ALL router settings including WiFi, vouchers and this panel. Are you absolutely sure?')) return;
+	if(!confirm('Last warning: this cannot be undone. Continue?')) return;
+	api('factory_reset').then(function(){ toast('Factory reset started...'); });
+}
+
+fillSpeeds();
+boot();
+</script>
+</body>
+</html>
+PAGEEOF
+exit 0
