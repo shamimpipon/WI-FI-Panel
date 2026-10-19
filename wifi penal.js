@@ -1,6 +1,6 @@
 // ============================================
 // SHAMIM WiFi - Panel Update Server (Cloudflare Worker)
-// Serves both files needed by the SHAMIM WiFi hotspot system:
+// Serves both files needed by the SHAMIM WiFi hotspot system: 19/10/2026
 //   /shamim  -> admin panel CGI script  (install to /www/cgi-bin/shamim)
 //   /theme   -> openNDS voucher theme   (install to /usr/lib/opennds/theme_voucher.sh)
 // URL:  https://wifipanel1.shamim-iptv.workers.dev/shamim
